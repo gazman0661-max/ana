@@ -1,0 +1,211 @@
+name: Build (zip ac + derle)
+
+on:
+  workflow_dispatch:
+    inputs:
+      gradle_version:
+        description: "Opsiyonel Gradle surumu, ornek 9.3.1 (bos birakirsan sablonun kendi surumu kullanilir)"
+        required: false
+        default: ""
+  push:
+    branches: [main, master]
+
+env:
+  GODOT_VERSION: "4.7.2"
+  GODOT_STATUS: "stable"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      # Godot 4 icin JDK 17 gerekir. Runner'daki varsayilan JDK yeni (25) olabilir
+      # ve Gradle 8.11.1 ile uyumsuz kalabilir, o yuzden 17'yi sabitliyoruz.
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Proje klasorunu bul
+        id: proj
+        run: |
+          set -euo pipefail
+          # Repoda zip varsa (en yeni surum adli) onu ac ve ondan derle; yoksa acik klasoru kullan.
+          Z=$(find . -maxdepth 2 -name '*.zip' -not -path './.git/*' -not -path './_src/*' | sort -V | tail -n1 || true)
+          if [ -n "$Z" ]; then
+            echo "Zip bulundu, aciliyor: $Z"
+            rm -rf _src && mkdir _src
+            unzip -q "$Z" -d _src
+            SEARCH=_src
+          else
+            SEARCH=.
+          fi
+          P=$(dirname "$(find "$SEARCH" -name project.godot -not -path '*/.godot/*' | head -n1)")
+          echo "Proje klasoru: $P"
+          echo "dir=$P" >> "$GITHUB_OUTPUT"
+
+      - name: Godot ve export sablonlarini indir
+        run: |
+          set -euo pipefail
+          V="${GODOT_VERSION}-${GODOT_STATUS}"
+          B1="https://github.com/godotengine/godot-builds/releases/download/${V}"
+          B2="https://github.com/godotengine/godot/releases/download/${V}"
+          curl -fsSL -o godot.zip "$B1/Godot_v${V}_linux.x86_64.zip" || curl -fsSL -o godot.zip "$B2/Godot_v${V}_linux.x86_64.zip"
+          curl -fsSL -o templates.tpz "$B1/Godot_v${V}_export_templates.tpz" || curl -fsSL -o templates.tpz "$B2/Godot_v${V}_export_templates.tpz"
+          unzip -q godot.zip
+          sudo mv "Godot_v${V}_linux.x86_64" /usr/local/bin/godot
+          sudo chmod +x /usr/local/bin/godot
+          TD="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.${GODOT_STATUS}"
+          mkdir -p "$TD" tpl
+          unzip -q templates.tpz -d tpl
+          mv tpl/templates/* "$TD/"
+          ls "$TD" | head -30
+
+      - name: Android build sablonunu projeye kur
+        working-directory: ${{ steps.proj.outputs.dir }}
+        env:
+          GRADLE_VERSION_INPUT: ${{ inputs.gradle_version }}
+        run: |
+          set -euo pipefail
+          TD="$HOME/.local/share/godot/export_templates/${GODOT_VERSION}.${GODOT_STATUS}"
+          if [ ! -f android/build/build.gradle ]; then
+            mkdir -p android/build
+            unzip -q "$TD/android_source.zip" -d android/build
+            echo "${GODOT_VERSION}.${GODOT_STATUS}" > android/.build_version
+          fi
+          touch android/build/.gdignore
+          if [ -n "${GRADLE_VERSION_INPUT:-}" ]; then
+            python3 - <<'PY'
+          import os, re
+          v = os.environ["GRADLE_VERSION_INPUT"].strip()
+          p = "android/build/gradle/wrapper/gradle-wrapper.properties"
+          t = open(p).read()
+          t = re.sub(r"^distributionUrl=.*$", "distributionUrl=https\\://services.gradle.org/distributions/gradle-%s-bin.zip" % v, t, flags=re.M)
+          open(p, "w").write(t)
+          print("Gradle surumu ayarlandi:", v)
+          PY
+          fi
+          echo "--- gradle-wrapper.properties ---"
+          cat android/build/gradle/wrapper/gradle-wrapper.properties || true
+          echo "--- config.gradle ---"
+          cat android/build/config.gradle || true
+
+      - name: LevelPlayAds Java dosyasini sablona kopyala (export eklentisine guvenme)
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -euo pipefail
+          echo "--- sablondaki Java/Kotlin kaynaklari ---"
+          find android/build -type f \( -name '*.java' -o -name '*.kt' \) | head -n 20
+          G=$(find android/build -type f -name 'GodotApp.*' -path '*com/godot/game*' | head -n1 || true)
+          if [ -n "$G" ]; then ROOT="${G%/com/godot/game/*}"; else ROOT="android/build/src"; fi
+          echo "Kaynak kok klasoru: $ROOT"
+          mkdir -p "$ROOT/com/terlik/levelplayads"
+          cp addons/LevelPlayAds/android_src/com/terlik/levelplayads/*.java "$ROOT/com/terlik/levelplayads/"
+          ls -la "$ROOT/com/terlik/levelplayads/"
+          echo "--- build.gradle sourceSets ---"
+          grep -n -A8 "sourceSets" android/build/build.gradle || true
+
+      - name: Android SDK paketlerini kur
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -euo pipefail
+          SDK="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-/usr/local/lib/android/sdk}}"
+          SM="$SDK/cmdline-tools/latest/bin/sdkmanager"
+          CFG="android/build/config.gradle"
+          BT=$(grep -E "buildTools" "$CFG" | head -n1 | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" || true)
+          CS=$(grep -E "compileSdk" "$CFG" | head -n1 | grep -oE "[0-9]+" | head -n1 || true)
+          NDK=$(grep -E "ndkVersion" "$CFG" | head -n1 | grep -oE "[0-9]+\.[0-9]+\.[0-9]+" || true)
+          TS=$(grep -E "^gradle_build/target_sdk" export_presets.cfg | head -n1 | grep -oE "[0-9]+" || true)
+          echo "buildTools=$BT compileSdk=$CS ndk=$NDK targetSdk=$TS"
+          PK=("platform-tools" "build-tools;35.0.1")
+          [ -n "$BT" ] && PK+=("build-tools;$BT")
+          [ -n "$CS" ] && PK+=("platforms;android-$CS")
+          [ -n "$TS" ] && PK+=("platforms;android-$TS")
+          [ -n "$NDK" ] && PK+=("ndk;$NDK")
+          yes | "$SM" --licenses > /dev/null || true
+          "$SM" "${PK[@]}"
+          echo "ANDROID_SDK_PATH=$SDK" >> "$GITHUB_ENV"
+
+      - name: Gecici anahtarlar ve Godot ayarlari (sir/base64 yok)
+        run: |
+          set -euo pipefail
+          # Debug APK icin standart debug anahtari
+          keytool -genkeypair -keystore "$RUNNER_TEMP/debug.keystore" -alias androiddebugkey \
+            -keypass android -storepass android -keyalg RSA -keysize 2048 -validity 9999 \
+            -dname "CN=Android Debug,O=Android,C=US"
+          # Release AAB'yi Godot'nun derleyebilmesi icin gecici anahtar.
+          # AAB'nin imzasi sonraki adimda silinir, gercek imzayi sen atacaksin.
+          keytool -genkeypair -keystore "$RUNNER_TEMP/tmp-release.keystore" -alias tmpkey \
+            -keypass tmppass123 -storepass tmppass123 -keyalg RSA -keysize 2048 -validity 9999 \
+            -dname "CN=Gecici,O=CI,C=TR"
+          {
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_PATH=$RUNNER_TEMP/debug.keystore"
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_USER=androiddebugkey"
+            echo "GODOT_ANDROID_KEYSTORE_DEBUG_PASSWORD=android"
+            echo "GODOT_ANDROID_KEYSTORE_RELEASE_PATH=$RUNNER_TEMP/tmp-release.keystore"
+            echo "GODOT_ANDROID_KEYSTORE_RELEASE_USER=tmpkey"
+            echo "GODOT_ANDROID_KEYSTORE_RELEASE_PASSWORD=tmppass123"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$HOME/.config/godot"
+          for f in editor_settings-4.7.tres editor_settings-4.tres; do
+            cat > "$HOME/.config/godot/$f" <<EOS
+          [gd_resource type="EditorSettings" format=3]
+
+          [resource]
+          export/android/java_sdk_path = "$JAVA_HOME"
+          export/android/android_sdk_path = "$ANDROID_SDK_PATH"
+          EOS
+          done
+
+      - name: Disa aktar (debug APK + release AAB)
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          godot --headless --path . --import || true
+          godot --headless --path . --export-debug "Android APK Debug" build/terlik_debug.apk 2>&1 | tee build/export_debug.log
+          godot --headless --path . --export-release "Android AAB" build/terlik_release.aab
+          test -s build/terlik_debug.apk
+          test -s build/terlik_release.aab
+          echo "--- LevelPlayAds satirlari (export logu) ---"
+          grep -i "levelplay" build/export_debug.log || echo "UYARI: export logunda LevelPlayAds satiri yok -> eklenti calismamis olabilir"
+
+      - name: LevelPlayAds eklentisi APK'ya girmis mi kontrol et
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          python3 - <<'PY'
+          import zipfile
+          z = zipfile.ZipFile("build/terlik_debug.apk")
+          man = z.read("AndroidManifest.xml")
+          in_man = (b"LevelPlayAds" in man) or ("LevelPlayAds".encode("utf-16le") in man)
+          in_dex = any(b"com/terlik/levelplayads/LevelPlayAdsPlugin" in z.read(n) for n in z.namelist() if n.endswith(".dex"))
+          print("Manifest'te eklenti kaydi :", "VAR" if in_man else "YOK")
+          print("DEX'te eklenti sinifi     :", "VAR" if in_dex else "YOK")
+          if not (in_man and in_dex):
+              print("::error::LevelPlayAds eklentisi APK'ya girmemis, oyun TEST BANNER (stub) modunda calisir")
+          PY
+
+      - name: AAB'nin gecici imzasini sil (imzasiz AAB)
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -euo pipefail
+          cp build/terlik_release.aab build/terlik_unsigned.aab
+          zip -q -d build/terlik_unsigned.aab 'META-INF/*.SF' 'META-INF/*.RSA' 'META-INF/*.DSA' 'META-INF/*.EC' 'META-INF/MANIFEST.MF' || true
+          jarsigner -verify build/terlik_unsigned.aab || true
+          ls -la build
+
+      - name: Debug APK yukle
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ steps.proj.outputs.dir }}/build/terlik_debug.apk
+          archive: false
+          if-no-files-found: error
+
+      - name: Imzasiz AAB yukle
+        uses: actions/upload-artifact@v7
+        with:
+          path: ${{ steps.proj.outputs.dir }}/build/terlik_unsigned.aab
+          archive: false
+          if-no-files-found: error
