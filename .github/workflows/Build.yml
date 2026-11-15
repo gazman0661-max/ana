@@ -183,6 +183,10 @@ jobs:
           in_dex = any(b"com/terlik/levelplayads/LevelPlayAdsPlugin" in z.read(n) for n in z.namelist() if n.endswith(".dex"))
           print("Manifest'te eklenti kaydi :", "VAR" if in_man else "YOK")
           print("DEX'te eklenti sinifi     :", "VAR" if in_dex else "YOK")
+          in_priv = any(b"com/unity3d/mediation/LevelPlayPrivacySettings" in z.read(n) for n in z.namelist() if n.endswith(".dex"))
+          print("DEX'te GDPR sinifi        :", "VAR" if in_priv else "YOK")
+          if not in_priv:
+              print("::warning::LevelPlayPrivacySettings sinifi bulunamadi: GDPR rizasi LevelPlay'e iletilemeyebilir (SDK 9.5.0+ gerekir)")
           if not (in_man and in_dex):
               print("::error::LevelPlayAds eklentisi APK'ya girmemis, oyun TEST BANNER (stub) modunda calisir")
           PY
