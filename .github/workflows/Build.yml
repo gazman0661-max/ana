@@ -13,6 +13,8 @@ on:
 env:
   GODOT_VERSION: "4.7.2"
   GODOT_STATUS: "stable"
+  # Play Console > Oyun Hizmetleri > Yapilandirma > "Proje kimligi"
+  PGS_PROJECT_ID: "317205084582"
 
 jobs:
   build:
@@ -107,6 +109,20 @@ jobs:
           echo "--- build.gradle sourceSets ---"
           grep -n -A8 "sourceSets" android/build/build.gradle || true
 
+      - name: Play Games proje kimligini yaz (export eklentisine guvenme)
+        working-directory: ${{ steps.proj.outputs.dir }}
+        run: |
+          set -euo pipefail
+          mkdir -p android/build/res/values
+          cat > android/build/res/values/games_ids.xml <<EOF
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="game_services_project_id" translatable="false">${PGS_PROJECT_ID}</string>
+          </resources>
+          EOF
+          echo "--- games_ids.xml ---"
+          cat android/build/res/values/games_ids.xml
+
       - name: Android SDK paketlerini kur
         working-directory: ${{ steps.proj.outputs.dir }}
         run: |
@@ -171,12 +187,15 @@ jobs:
           test -s build/terlik_release.aab
           echo "--- LevelPlayAds satirlari (export logu) ---"
           grep -i "levelplay" build/export_debug.log || echo "UYARI: export logunda LevelPlayAds satiri yok -> eklenti calismamis olabilir"
+          echo "--- Play Games satirlari (export logu) ---"
+          grep -i "play games" build/export_debug.log || echo "Play Games uyarisi yok (ID dolu demek)"
 
-      - name: LevelPlayAds eklentisi APK'ya girmis mi kontrol et
+      - name: LevelPlayAds eklentisi ve Play Games ID APK'ya girmis mi kontrol et
         working-directory: ${{ steps.proj.outputs.dir }}
         run: |
           python3 - <<'PY'
-          import zipfile
+          import os, zipfile
+          pgs = os.environ["PGS_PROJECT_ID"]
           z = zipfile.ZipFile("build/terlik_debug.apk")
           man = z.read("AndroidManifest.xml")
           in_man = (b"LevelPlayAds" in man) or ("LevelPlayAds".encode("utf-16le") in man)
@@ -189,6 +208,16 @@ jobs:
               print("::warning::LevelPlayPrivacySettings sinifi bulunamadi: GDPR rizasi LevelPlay'e iletilemeyebilir (SDK 9.5.0+ gerekir)")
           if not (in_man and in_dex):
               print("::error::LevelPlayAds eklentisi APK'ya girmemis, oyun TEST BANNER (stub) modunda calisir")
+          key = "com.google.android.gms.games.APP_ID"
+          has_key = (key.encode() in man) or (key.encode("utf-16le") in man)
+          arsc = z.read("resources.arsc")
+          has_id = (pgs.encode() in arsc) or (pgs.encode("utf-16le") in arsc)
+          print("Manifest'te games APP_ID  :", "VAR" if has_key else "YOK")
+          print("Resources'ta proje kimligi:", "VAR" if has_id else "YOK")
+          if not has_key:
+              print("::warning::Manifestte com.google.android.gms.games.APP_ID yok: Play Games girisi calismayabilir (export eklentisi calismamis olabilir)")
+          if not has_id:
+              print("::warning::Play Games proje kimligi APK resources icinde bulunamadi")
           PY
 
       - name: AAB'nin gecici imzasini sil (imzasiz AAB)
@@ -213,3 +242,4 @@ jobs:
           path: ${{ steps.proj.outputs.dir }}/build/terlik_unsigned.aab
           archive: false
           if-no-files-found: error
+          
